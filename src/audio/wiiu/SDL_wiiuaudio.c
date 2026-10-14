@@ -112,8 +112,18 @@ static int WIIUAUDIO_OpenDevice(_THIS, const char* devname) {
     SDL_CalculateAudioSpec(&this->spec);
 
 /*  Allocate buffers for double-buffering and samples */
+    /* SONIC_MANIA_AX_DIAGNOSTIC_V13
+     * Allocate both mixing buffers in one contiguous region.
+     */
+    this->hidden->rawbuf = SDL_malloc(this->spec.size * NUM_BUFFERS);
+    if (this->hidden->rawbuf == NULL) {
+        AXQuit();
+        return SDL_OutOfMemory();
+    }
+
     for (int i = 0; i < NUM_BUFFERS; i++) {
-        this->hidden->mixbufs[i] = SDL_malloc(this->spec.size);
+        this->hidden->mixbufs[i] =
+            this->hidden->rawbuf + (this->spec.size * i);
         if (this->hidden->mixbufs[i] == NULL) {
             AXQuit();
             printf("DEBUG: Couldn't allocate buffer");
@@ -201,11 +211,9 @@ static int WIIUAUDIO_OpenDevice(_THIS, const char* devname) {
         this->hidden->playingid = 0;
         this->hidden->renderingid = 1;
 
-    /*  Start playing. */
+    /* Validated Wii U AX voice initialization. */
         AXSetVoiceState(this->hidden->voice[i], AX_VOICE_STATE_PLAYING);
-
-    /*  Okay, we're good */
-        AXVoiceEnd(this->hidden->voice[i]);
+        AXVoiceEnd(this->hidden->voice[i]); /* validated V19 sequence */
     }
 
     cb_this = this; //wish there was a better way
@@ -220,7 +228,6 @@ static int WIIUAUDIO_OpenDevice(_THIS, const char* devname) {
 static void _WIIUAUDIO_framecallback() {
     int playing_buffer = -1;
     AXVoiceOffsets offs[6];
-    void* endaddr;
 
     for (int i = 0; i < cb_this->spec.channels; i++) {
         AXGetVoiceOffsets(cb_hidden->voice[i], &offs[i]);
@@ -261,38 +268,53 @@ static void _WIIUAUDIO_framecallback() {
 /*  Make sure playingid is in sync with the hardware */
     cb_hidden->playingid = playing_buffer;
 
-/*  Make sure the end offset is correct for the playing buffer */
+/* Update AX end and loop offsets for double buffering. */
     for (int i = 0; i < cb_this->spec.channels; i++) {
-    /*  Calculate end address, aka start of the next (i+1) channel's buffer */
-        endaddr = cb_hidden->mixbufs[cb_hidden->playingid] +
-            (cb_this->spec.samples * sizeof_sample(offs[i]) * (i + 1));
+        Uint8 *endaddr;
+        Uint8 *loopaddr;
+        int loopTarget;
 
-    /*  Trial end error to try and limit popping */
-        endaddr -= 2;
+        endaddr = cb_hidden->mixbufs[cb_hidden->playingid]
+            + cb_this->spec.samples * sizeof_sample(offs[i]) * (i + 1)
+            - sizeof_sample(offs[i]);
 
         AXSetVoiceEndOffset(
             cb_hidden->voice[i],
             calc_ax_offset(offs[i], endaddr)
         );
 
-    /*  The next buffer is good to go, set the loop offset */
+        loopTarget = cb_hidden->playingid;
         if (cb_hidden->renderingid != next_id(cb_hidden->playingid)) {
-        /*  Calculate start address for this channel's buffer */
-            void* loopaddr = cb_hidden->mixbufs[next_id(cb_hidden->playingid)] +
-                (cb_this->spec.samples * sizeof_sample(offs[i]) * i);
-
-            AXSetVoiceLoopOffset(cb_hidden->voice[i], calc_ax_offset(offs[i], loopaddr));
-    /*  Otherwise, make sure the loop offset is correct for the playing buffer */
-        } else {
-            void* loopaddr = cb_hidden->mixbufs[cb_hidden->playingid] +
-                (cb_this->spec.samples * sizeof_sample(offs[i]) * i);
-
-            AXSetVoiceLoopOffset(cb_hidden->voice[i], calc_ax_offset(offs[i], loopaddr));
+            loopTarget = next_id(cb_hidden->playingid);
         }
+
+        loopaddr = cb_hidden->mixbufs[loopTarget]
+            + cb_this->spec.samples * sizeof_sample(offs[i]) * i;
+
+        AXSetVoiceLoopOffset(
+            cb_hidden->voice[i],
+            calc_ax_offset(offs[i], loopaddr)
+        );
     }
+
 }
 
 static void WIIUAUDIO_PlayDevice(_THIS) {
+    /* SONIC_MANIA_AX_DIAGNOSTIC_V8_RESTART */
+    static int restartDone = 0;
+
+    if (!restartDone) {
+        restartDone = 1;
+
+        for (int i = 0; i < this->spec.channels; i++) {
+            if (this->hidden->voice[i]) {
+                AXSetVoiceState(
+                    this->hidden->voice[i],
+                    AX_VOICE_STATE_PLAYING
+                );
+            }
+        }
+    }
 /*  Deinterleave stereo audio */
     switch (SDL_AUDIO_BITSIZE(this->spec.format)) {
         case 8: {
@@ -334,7 +356,14 @@ static void WIIUAUDIO_PlayDevice(_THIS) {
 
 static void WIIUAUDIO_WaitDevice(_THIS) {
 /*  TODO use real thread sync stuff */
+    /* SONIC_MANIA_AUDIO_WAIT_TIMEOUT_TEST_V1 */
+    const Uint32 waitStart = SDL_GetTicks();
+
     while (SDL_AtomicGet(&this->enabled) && this->hidden->renderingid == this->hidden->playingid) {
+        if ((Uint32)(SDL_GetTicks() - waitStart) >= 100U) {
+            break;
+        }
+
         OSSleepTicks(OSMillisecondsToTicks(3));
     }
 }
@@ -355,8 +384,10 @@ static void WIIUAUDIO_CloseDevice(_THIS) {
         }
         AXQuit();
     }
-    for (int i = 0; i < NUM_BUFFERS; i++) {
-        if (this->hidden->mixbufs[i]) SDL_free(this->hidden->mixbufs[i]);
+    /* SONIC_MANIA_AX_DIAGNOSTIC_V13_FREE */
+    if (this->hidden->rawbuf) {
+        SDL_free(this->hidden->rawbuf);
+        this->hidden->rawbuf = NULL;
     }
     if (this->hidden->deintvbuf) SDL_free(this->hidden->deintvbuf);
     SDL_free(this->hidden);
