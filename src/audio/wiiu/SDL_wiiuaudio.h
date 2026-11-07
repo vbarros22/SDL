@@ -43,9 +43,13 @@ struct SDL_PrivateAudioData {
     /* Deinterleaving buffer. */
     Uint8   *deintvbuf;
 
-    int renderingid;
-    int playingid;
+    /* Written by the AX frame callback (CPU1) and read by the audio
+       thread, so the compiler must not cache them. */
+    volatile int renderingid;
+    volatile int playingid;
     uint32_t last_loopcount;
+    /* Voices are kicked once more after the first buffer is rendered. */
+    SDL_bool voices_started;
 };
 
 #endif /* SDL_wiiuaudio_h_ */

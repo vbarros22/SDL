@@ -23,6 +23,9 @@
 #if SDL_AUDIO_DRIVER_WIIU
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <malloc.h>
 
 #include "SDL_audio.h"
 #include "SDL_error.h"
@@ -66,6 +69,7 @@ static int WIIUAUDIO_OpenDevice(_THIS, const char* devname) {
     };
     uint32_t old_affinity;
     float srcratio;
+    int result = 0;
 
     this->hidden = (struct SDL_PrivateAudioData*)SDL_malloc(sizeof(*this->hidden));
     if (this->hidden == NULL) return SDL_OutOfMemory();
@@ -111,35 +115,29 @@ static int WIIUAUDIO_OpenDevice(_THIS, const char* devname) {
 /*  We changed channels and samples, so recalculate the spec */
     SDL_CalculateAudioSpec(&this->spec);
 
-/*  Allocate buffers for double-buffering and samples */
-    /* SONIC_MANIA_AX_DIAGNOSTIC_V13
-     * Allocate both mixing buffers in one contiguous region.
-     */
-    this->hidden->rawbuf = SDL_malloc(this->spec.size * NUM_BUFFERS);
+/*  Allocate buffers for double-buffering and samples.
+    All mixing buffers live in ONE contiguous allocation: AX expresses the
+    loop/end offsets relative to the voice's data pointer (mixbufs[0]), so
+    every buffer must sit after it in memory. Separate allocations could
+    place mixbufs[1] below mixbufs[0] and produce bogus offsets.
+    Align to the cache line size because AX reads these through DMA. */
+    this->hidden->rawbuf = memalign(0x40, this->spec.size * NUM_BUFFERS);
     if (this->hidden->rawbuf == NULL) {
-        AXQuit();
-        return SDL_OutOfMemory();
+        result = SDL_OutOfMemory();
+        goto done;
     }
 
     for (int i = 0; i < NUM_BUFFERS; i++) {
-        this->hidden->mixbufs[i] =
-            this->hidden->rawbuf + (this->spec.size * i);
-        if (this->hidden->mixbufs[i] == NULL) {
-            AXQuit();
-            printf("DEBUG: Couldn't allocate buffer");
-            return SDL_SetError("Couldn't allocate buffer");
-        }
-
-        memset(this->hidden->mixbufs[i], 0, this->spec.size);
-        DCStoreRange(this->hidden->mixbufs[i], this->spec.size);
+        this->hidden->mixbufs[i] = this->hidden->rawbuf + (this->spec.size * i);
     }
+    memset(this->hidden->rawbuf, 0, this->spec.size * NUM_BUFFERS);
+    DCStoreRange(this->hidden->rawbuf, this->spec.size * NUM_BUFFERS);
 
 /*  Allocate a scratch buffer for deinterleaving operations */
     this->hidden->deintvbuf = SDL_malloc(this->spec.size);
     if (this->hidden->deintvbuf == NULL) {
-        AXQuit();
-        printf("DEBUG: Couldn't allocate deinterleave buffer");
-        return SDL_SetError("Couldn't allocate deinterleave buffer");
+        result = SDL_OutOfMemory();
+        goto done;
     }
 
 
@@ -147,9 +145,8 @@ static int WIIUAUDIO_OpenDevice(_THIS, const char* devname) {
     /*  Get a voice, top priority */
         this->hidden->voice[i] = AXAcquireVoice(31, NULL, NULL);
         if (!this->hidden->voice[i]) {
-            AXQuit();
-            printf("DEBUG: couldn't get voice\n");
-            return SDL_OutOfMemory();
+            result = SDL_SetError("Couldn't acquire an AX voice");
+            goto done;
         }
 
     /*  Start messing with it */
@@ -211,17 +208,21 @@ static int WIIUAUDIO_OpenDevice(_THIS, const char* devname) {
         this->hidden->playingid = 0;
         this->hidden->renderingid = 1;
 
-    /* Validated Wii U AX voice initialization. */
+    /*  Start playing. */
         AXSetVoiceState(this->hidden->voice[i], AX_VOICE_STATE_PLAYING);
-        AXVoiceEnd(this->hidden->voice[i]); /* validated V19 sequence */
+        AXVoiceEnd(this->hidden->voice[i]);
     }
 
     cb_this = this; //wish there was a better way
     AXRegisterAppFrameCallback(_WIIUAUDIO_framecallback);
 
-/*  Put the thread affinity back to normal - we won't call any more AX funcs */
+done:
+/*  Put the thread affinity back to normal - we won't call any more AX funcs.
+    This must also happen on failure, otherwise the calling thread (usually
+    the game's main thread) stays pinned to CPU1. On failure SDL calls
+    WIIUAUDIO_CloseDevice, which releases everything allocated above. */
     OSSetThreadAffinity(OSGetCurrentThread(), old_affinity);
-    return 0;
+    return result;
 }
 
 /*  Called every 3ms before a frame of audio is rendered. Keep it fast! */
@@ -296,22 +297,20 @@ static void _WIIUAUDIO_framecallback() {
             calc_ax_offset(offs[i], loopaddr)
         );
     }
-
 }
 
 static void WIIUAUDIO_PlayDevice(_THIS) {
-    /* SONIC_MANIA_AX_DIAGNOSTIC_V8_RESTART */
-    static int restartDone = 0;
-
-    if (!restartDone) {
-        restartDone = 1;
+/*  Kick the voices once more after the first buffer has been mixed. Some
+    setups leave them stopped after OpenDevice. Tracked per device (not in a
+    static) so it also happens after the device is closed and reopened. */
+    if (!this->hidden->voices_started) {
+        this->hidden->voices_started = SDL_TRUE;
 
         for (int i = 0; i < this->spec.channels; i++) {
             if (this->hidden->voice[i]) {
-                AXSetVoiceState(
-                    this->hidden->voice[i],
-                    AX_VOICE_STATE_PLAYING
-                );
+                AXVoiceBegin(this->hidden->voice[i]);
+                AXSetVoiceState(this->hidden->voice[i], AX_VOICE_STATE_PLAYING);
+                AXVoiceEnd(this->hidden->voice[i]);
             }
         }
     }
@@ -356,11 +355,17 @@ static void WIIUAUDIO_PlayDevice(_THIS) {
 
 static void WIIUAUDIO_WaitDevice(_THIS) {
 /*  TODO use real thread sync stuff */
-    /* SONIC_MANIA_AUDIO_WAIT_TIMEOUT_TEST_V1 */
+/*  Give up after a few buffer lengths so that a stalled AX (e.g. while the
+    app is in the background) can never hang the audio thread or block
+    SDL_CloseAudioDevice. If we give up, GetDeviceBuf notices that no buffer
+    is free and lets SDL mix into its scratch buffer instead. */
+    const Uint32 bufferMs = (this->spec.samples * 1000) / this->spec.freq;
+    const Uint32 timeoutMs = SDL_max(bufferMs * 4, 50);
     const Uint32 waitStart = SDL_GetTicks();
 
-    while (SDL_AtomicGet(&this->enabled) && this->hidden->renderingid == this->hidden->playingid) {
-        if ((Uint32)(SDL_GetTicks() - waitStart) >= 100U) {
+    while (SDL_AtomicGet(&this->enabled) && !SDL_AtomicGet(&this->shutdown) &&
+           this->hidden->renderingid == this->hidden->playingid) {
+        if ((Uint32)(SDL_GetTicks() - waitStart) >= timeoutMs) {
             break;
         }
 
@@ -369,8 +374,17 @@ static void WIIUAUDIO_WaitDevice(_THIS) {
 }
 
 static Uint8* WIIUAUDIO_GetDeviceBuf(_THIS) {
+/*  If the hardware is still playing the buffer we would render into (the wait
+    above timed out), return NULL: SDL then mixes into its own work buffer and
+    sleeps for one buffer length, instead of us overwriting audio that is
+    currently being played (which would be heard as a pop). */
+    const int renderingid = this->hidden->renderingid;
+    if (renderingid == this->hidden->playingid) {
+        return NULL;
+    }
+
 /*  SDL will write audio samples into this buffer */
-    return this->hidden->mixbufs[this->hidden->renderingid];
+    return this->hidden->mixbufs[renderingid];
 }
 
 static void WIIUAUDIO_CloseDevice(_THIS) {
@@ -384,9 +398,9 @@ static void WIIUAUDIO_CloseDevice(_THIS) {
         }
         AXQuit();
     }
-    /* SONIC_MANIA_AX_DIAGNOSTIC_V13_FREE */
+    /* rawbuf comes from memalign(), so release it with free() */
     if (this->hidden->rawbuf) {
-        SDL_free(this->hidden->rawbuf);
+        free(this->hidden->rawbuf);
         this->hidden->rawbuf = NULL;
     }
     if (this->hidden->deintvbuf) SDL_free(this->hidden->deintvbuf);

@@ -366,7 +366,7 @@ static inline GX2BlendMode WIIU_SDL_GetBlendMode(SDL_BlendFactor factor)
         case SDL_BLENDFACTOR_DST_ALPHA:
             return GX2_BLEND_MODE_DST_ALPHA;
         case SDL_BLENDFACTOR_ONE_MINUS_DST_ALPHA:
-            return GX2_BLEND_MODE_INV_DST_COLOR;
+            return GX2_BLEND_MODE_INV_DST_ALPHA;
         default:
             return -1;
     }
