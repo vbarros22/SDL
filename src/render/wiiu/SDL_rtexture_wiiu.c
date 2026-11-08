@@ -296,9 +296,10 @@ void WIIU_SDL_UnlockTexture(SDL_Renderer * renderer, SDL_Texture * texture)
 
 void WIIU_SDL_SetTextureScaleMode(SDL_Renderer * renderer, SDL_Texture * texture, SDL_ScaleMode scaleMode)
 {
+    WIIU_RenderData *data = (WIIU_RenderData *) renderer->driverdata;
     WIIU_TextureData *tdata = (WIIU_TextureData *) texture->driverdata;
 
-    const GX2TexXYFilterMode filter_mode = texture->scaleMode == SDL_ScaleModeNearest ? GX2_TEX_XY_FILTER_MODE_POINT : GX2_TEX_XY_FILTER_MODE_LINEAR;
+    const GX2TexXYFilterMode filter_mode = scaleMode == SDL_ScaleModeNearest ? GX2_TEX_XY_FILTER_MODE_POINT : GX2_TEX_XY_FILTER_MODE_LINEAR;
 
     GX2InitSampler(&tdata->main_plane.sampler, GX2_TEX_CLAMP_MODE_CLAMP, filter_mode);
 
@@ -309,6 +310,14 @@ void WIIU_SDL_SetTextureScaleMode(SDL_Renderer * renderer, SDL_Texture * texture
         GX2InitSampler(&tdata->v_plane.sampler, GX2_TEX_CLAMP_MODE_CLAMP, filter_mode);
     }
 #endif
+
+    /* The sampler is only sent to the GPU when the bound texture changes
+       (see WIIU_SDL_SetDrawState). If this texture is the one currently bound,
+       forget it so the next draw rebinds it with the new filter; otherwise a
+       renderer that keeps drawing the same texture never sees the change. */
+    if (data->drawState.texture == texture) {
+        data->drawState.texture = NULL;
+    }
 }
 
 int WIIU_SDL_UpdateTexture(SDL_Renderer * renderer, SDL_Texture * texture,
